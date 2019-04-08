@@ -1,0 +1,628 @@
+---
+title: "Applied Data Science:  Midterm Project"
+author: "Group 9"
+date: "2019-03-14"
+output:
+  prettydoc::html_pretty:
+  theme: cayman
+highlight: github
+---
+
+```{r setup, include=FALSE}
+set.seed(72)
+knitr::opts_chunk$set(echo = TRUE, comment="", warning = FALSE, message = FALSE, tidy.opts=list(width.cutoff=55))
+```
+
+```{r libraries, echo = FALSE}
+library(data.table)
+library(DT)
+library(class)
+library(glmnet)
+library(randomForest)
+library(e1071)
+library(xgboost)
+library(nnet)
+library(rpart)
+```
+
+## Preface
+
+In this midterm project, our group aim to organize the coding style and make it concise. Each machine learning function uses the same structure so that it can be easily read. Our report for each model is listed at the end of the model and there is a briefly discussion at the end of the script. We hope you enjoy this project and give us some further suggestions. Thank you!
+
+```{r source_files}
+train.path <- "../Data/MNIST-fashion training set-49.csv"
+test.path <- "../Data/MNIST-fashion testing set-49.csv"
+```
+
+```{r functions}
+create.formula <- function(outcome.name, input.names, input.patterns = NA,
+all.data.names = NA, return.as = "character") {
+  variable.names.from.patterns <- c()
+  if (!is.na(input.patterns[1]) & !is.na(all.data.names[1])) {
+  pattern <- paste(input.patterns, collapse = "|")
+  variable.names.from.patterns <- all.data.names[grep(pattern = pattern,
+  x = all.data.names)]
+  }
+  all.input.names <- unique(c(input.names, variable.names.from.patterns))
+  all.input.names <- all.input.names[all.input.names !=
+  outcome.name]
+  if (!is.na(all.data.names[1])) {
+  all.input.names <- all.input.names[all.input.names %in%
+  all.data.names]
+  }
+  input.names.delineated <- sprintf("`%s`", all.input.names)
+  the.formula <- sprintf("`%s` ~ %s", outcome.name, paste(input.names.delineated,
+  collapse = " + "))
+  if (return.as == "formula") {
+  return(as.formula(the.formula))
+  }
+  if (return.as != "formula") {
+  return(the.formula)
+  }
+}
+
+model.avg <- function(total.result, model.name){
+  res.list <- data.table()
+  for (i in 0:2){
+    sample.size <- total.result[i*3+1, `Sample size`]
+    size.model.name <- paste(model.name,sample.size,sep='_')
+    proportion <- total.result[i*3+1, A]
+    avg.time <- round((total.result[i*3+1,B] + total.result[i*3+2,B] + total.result[i*3+3,B])/3, 3)
+    avg.error <- round((total.result[i*3+1,C] + total.result[i*3+2,C] + total.result[i*3+3,C])/3, 3)
+    avg.points <- round(round(0.25 * proportion + 0.25 * avg.time + 0.5 * avg.error,3), 3)
+    tmp.datatable <- data.table("Model" = size.model.name,"Sample size" = sample.size,
+                                "A" = proportion, "B" = avg.time, "C" = avg.error, 
+                                "Points" = avg.points)
+    res.list <- rbind(res.list,tmp.datatable)
+  }
+  return(res.list)
+}
+```
+# Create Formula Function
+For some of models we use, the input of prediction needs to be a formula but not datasets with certain features. This function transforms datasets into a formula so that it can be put in to predict function.
+
+# Model Average Function
+Calculate the average data proportion, time, accuracy and score for models have the same size of training data.
+
+```{r constants}
+n.values <- c(500, 1000, 2000)
+iterations <- 3
+predictions <- list()
+runtimes <- list()
+result1 <- data.table()
+result2 <- data.table()
+```
+
+```{r load_data}
+train.data <- fread(train.path)
+test.data <- fread(test.path)
+```
+
+```{r clean_data}
+train.data$label <-as.factor(train.data$label)
+test.data$label <- as.factor(test.data$label)
+train.list <- list()
+res.group <- unique(train.data$label)
+classify.label <- function(n,data){
+  return(data[data$label==res.group[n]])
+}
+for(i in 1:length(res.group)){
+  assign(paste("train.group",i,sep=''),classify.label(i,train.data))
+  train.list[[i]] <- get(paste("train.group",i,sep=''))
+}
+```
+
+# generate sample datasets
+```{r generate_samples}
+generate_sample <- function(n.value=10500,train.list){
+  result <- list() # create a list to store the result
+  dat_group_list <- list()
+  n.value.group <- n.value/10 # give 10 labels same amount of training sets
+  res <- data.table()
+  for (i in 1:10) {
+    index <- sample(6000,n.value.group) # sample from 10 labels group
+    res <- rbind(res,train.list[[i]][index,])
+  }
+dat_list <- list()
+for (i in 1:10) {
+  i_lower <- (i-1)*1050+1
+  i_upper <- i*1050
+  dat_tmp <- res[i_lower:i_upper]
+  dat_list[[i]] <- dat_tmp
+}
+
+piece <- c(0,50,100,150,250,350,450,650,850,1050) # cut each sample sets in 9 groups
+for (i in 1:9) { # The sample size is 500, 1000, 2000, 3 datasets for each size
+  b <- i %% 3 + 1
+  if(i<=3){
+    a <- 500
+  }
+  else if(i<=6){
+    a <- 1000
+  }else{
+    a <- 2000
+  }
+  lower <- piece[i] + 1
+  upper <- piece[i+1]
+  tmp <- data.frame()
+  for(j in 1:10){
+    tp <- dat_list[[j]][lower:upper]
+    tmp <- rbind(tmp,tp)
+    
+  }
+  assign(paste("dat",a,b,sep='_'), tmp)
+  result[[i]] <- get(paste("dat",a,b,sep="_"))
+}
+return(result) # return all sample datasets in a single list
+}
+
+dat_whole_1 <- generate_sample(10500, train.list) # sample the training datasets
+
+```
+# Generate Sample Function
+Since mnist datasets have 10 labels and each label has 6000 rows of data, we decide to sample each dataset with same amount of data in each label. For example, for a model with 500 rows of data, we sample out each label with 50 rows and 500 in totals. Meanwhile, for different model with same data size, the function chooses completely different data from training datasets to test if each model has similar performance for different training model.
+
+
+## Introduction
+
+In this project, we are trying to classify images using various machine learning models with the goal of predicting classifications. Data is acquired from MNIST database with 6000 records from 10 different groups as training dataset (in total of 60000 training data) and 10000 as testing data. Each image is divided into 49 pixels (7x7), and thus there are 49 predictors in each model presented below. Our goal in this project is to find the best model to predict the label of an image based on the given 49 pixels. 
+
+Our first step is sampling training datasets from the 60000 records. The sizes of the training datasets are chosen to be 500, 1000, and 2000 for the consideration of model complexity and runtime. For each size, we sample three balanced datasets from the training data without replacement. Next, we train the 9 datasets using 10 models with the last one as the ensembling model. The models covered in our analysis include (in the order of analysis presented): Classification Tree, Random Forest, Support Vector Machines, NaÃ¯ve Bayes, Neural Networks, Multinomial Logistic Regression, and K-Nearest Neighbors. Among the list, some of the models are fitted with different settings of parameters. To evaluate the model efficiency, the following penalty formula is adopted: 0.25 x A + 0.25 x B + 0.5 x C, where A is the proportion of sample size, B is the standardized run-time, and C is the proportion of misclassification. As a result, the lowest points will yield the most efficient classification model.
+
+
+### Model 1:  
+
+Classification tree model
+```{r code_model1_development, eval = TRUE}
+Classification.tree.formula <- create.formula("label",names(train.data)[2:50])
+# Classification tree model is a single tree model with limit tree nodes
+classify.tree.model <- function(train.list,formula.tree){ # build tree model
+  res.list <- data.table() # return the result as a datatable
+  for (i in 1:length(train.list)) { # train model with each training dataset
+    num <- ifelse(i %% 3 == 0, 3, i %% 3)
+    sample.size = nrow(train.list[[i]])
+    model.name <- paste("classiftree",sample.size,num,sep='_') # name the model
+    proportion <- round(sample.size/60000,4) # proportion of dataset
+    t.start <- Sys.time()
+    model.classiftree <- rpart(formula = formula.tree, data=train.list[[i]],method="class") # build the model
+    preds <- predict(model.classiftree, newdata = test.data[,2:50], type = "class") # predict function only return prediction
+    t.end <- Sys.time()
+    time <- round(min(1,(t.end - t.start)/60),4) # get time for training model
+    error <- round(mean(preds != test.data$label),4) # calculate the error
+    Points <- round(0.25 * proportion + 0.25 * time + 0.5 * error,4) # calculate points of model
+    tmp.datatable <- data.table("Model" = model.name,"Sample size" = sample.size,
+                                "A" = proportion, "B" = time, "C" = error, 
+                                "Points" = Points)
+    res.list <- rbind(res.list,tmp.datatable)
+    predictions[[i]] <<- as.data.frame(preds)
+    runtimes[[i]] <<- as.data.frame(time)
+  }
+  return(res.list)
+}
+```
+
+```{r load_model1}
+classify.tree.table <- classify.tree.model(dat_whole_1,Classification.tree.formula)
+datatable(classify.tree.table, rownames = FALSE)
+classify.tree.avg.table <- model.avg(classify.tree.table, "classifytree")
+datatable(classify.tree.avg.table, rownames = FALSE)
+result1 <- rbind(result1,classify.tree.table)
+result2 <- rbind(result2,classify.tree.avg.table)
+```
+Decision tree learning uses a decision tree (as a predictive model) to go from observations about an item (represented in the branches) to conclusions about the item's target value (represented in the leaves). It is one of the predictive modeling approaches used in statistics, data mining and machine learning.
+
+The Classification Tree Model is the decision tree model for classification supervised learning. In this case, the error rate is about 35% which is relatively high. At the same time, the score doesn¡¯t change significantly through the training data size changes. In fact, it is not a well fitted model to predict for this dataset.
+
+### Model 2:  
+
+Random Forest
+```{r code_model2_development, eval = TRUE}
+rf.model <- function(train.list,n.tree = 500){ # build a randomforest model
+  res.list <- data.table() 
+  for (i in 1:length(train.list)) {
+    num <- ifelse(i %% 3 == 0, 3, i %% 3)
+    sample.size = nrow(train.list[[i]])
+    model.name <- paste("randomforest",sample.size,num,"noden",n.tree,sep='_') 
+    proportion <- round(sample.size/60000,4)
+    t.start <- Sys.time()
+    model.randomf <- randomForest(train.list[[i]][,2:50], train.list[[i]]$label,
+                                  ntree = n.tree)
+    preds <- predict(model.randomf, newdata = test.data[,2:50], predict.all=TRUE)  # predict labels for test dataset
+    t.end <- Sys.time()
+    time <- round(min(1,(t.end - t.start)/60),4)
+    error <- round(mean(preds$aggregate != test.data$label),4)
+    Points <- round(0.25 * proportion + 0.25 * time + 0.5 * error,4)
+    tmp.datatable <- data.table("Model" = model.name,"Sample size" = sample.size,
+                                "A" = proportion, "B" = time, "C" = error, 
+                                "Points" = Points)
+    res.list <- rbind(res.list,tmp.datatable)
+    predictions[[i]] <<- cbind(predictions[[i]],as.data.frame(preds$aggregate))
+    runtimes[[i]] <<- cbind(runtimes[[i]],as.data.frame(time))
+  }
+  return(res.list)
+}
+
+```
+
+```{r load_model2}
+rf.table <- rf.model(train.list = dat_whole_1)
+datatable(rf.table, rownames = FALSE)
+rf.avg.table <- model.avg(rf.table, "randomforest_nnode500")
+datatable(rf.avg.table, rownames = FALSE)
+result1 <- rbind(result1,rf.table)
+result2 <- rbind(result2,rf.avg.table)
+```
+Random forests or random decision forests are an ensemble learning method for classification, regression and other tasks that operates by constructing a multitude of decision trees at training time and outputting the class that is the mode of the classes (classification) or mean prediction (regression) of the individual trees. Random decision forests correct for decision trees' habit of overfitting to their training set.
+
+The Random forests model shows that the error rate is decreased obviously and has a positive correlated with training data size. However, the model spends much longer time on fitting and prediction for Random Forest model and it can be improved by changing some parameters. For example, this model has a default numbers of tree models (500) and we may not use that many.
+
+### Model 3:  
+
+# Random Forest model with less tree nodes
+```{r code_model3_development, eval = TRUE}
+
+```
+
+```{r load_model3}
+rf.table.new <- rf.model(train.list = dat_whole_1, n.tree = 100)
+datatable(rf.table.new, rownames = FALSE)
+rf.avg.table.new <- model.avg(rf.table.new, "randomforest_nnode100")
+datatable(rf.avg.table.new, rownames = FALSE)
+result1 <- rbind(result1,rf.table.new)
+result2 <- rbind(result2,rf.avg.table.new)
+```
+The time spends shortly when we choose a less number of tree model and the accuracy is not affected significant. Overall, tree base model is related work well on this datasets. For further improvement, we can still tree to change the maximum number of tree nodes and weighted for each features. Another way to improve accuracy of model is input a larger training data set to make machine learning model training on more samples. However, Random Forest model spends long time on training model if the data is too much. Hence, the balance of tree numbers, tree nodes, and datasets size need to be taken care of.
+
+### Model 4
+
+Support Vector Machine
+```{r code_model4_development, eval = TRUE}
+svm.model <- function(train.list){
+  res.list <- data.table()
+  for (i in 1:length(train.list)) {
+    num <- ifelse(i %% 3 == 0, 3, i %% 3)
+    sample.size = nrow(train.list[[i]])
+    model.name <- paste("svm",sample.size,num,sep='_')
+    proportion <- round(sample.size/60000,4)
+    t.start <- Sys.time()
+    model.svm <- svm(train.list[[i]][,2:50], train.list[[i]]$label)
+    preds <- predict(model.svm, newdata = test.data[,2:50])
+    t.end <- Sys.time()
+    time <- round(min(1,(t.end - t.start)/60),4)
+    error <- round(1-sum(test.data$label==preds)/nrow(test.data),4)
+    Points <- round(0.25 * proportion + 0.25 * time + 0.5 * error,4)
+    tmp.datatable <- data.table("Model" = model.name,"Sample size" = sample.size,
+                                "A" = proportion, "B" = time, "C" = error, 
+                                "Points" = Points)
+    res.list <- rbind(res.list,tmp.datatable)
+    predictions[[i]] <<- cbind(predictions[[i]],as.data.frame(preds,col.names = c("svm")))
+    runtimes[[i]] <<- cbind(runtimes[[i]],as.data.frame(time))
+  }
+  return(res.list)
+}
+```
+
+```{r load_model4}
+svm.table <- svm.model(train.list = dat_whole_1)
+datatable(svm.table, rownames = FALSE)
+svm.avg.table <- model.avg(svm.table, "svm")
+datatable(svm.avg.table, rownames = FALSE)
+result1 <- rbind(result1,svm.table)
+result2 <- rbind(result2,svm.avg.table)
+```
+Support Vector Machine: an ordinary support vector machine is a linear classifier. It¡¯s also
+known as the ¡°maximum margin classifier¡± in that for any two linearly separable classes, the
+resulting decision boundaries would maximize the distance between the two classes. Only the
+default setting is used for the dataset. Without any tuning, here the error of our models starts
+from 26%, with more data, it can go down to 20%. Among all the non-well-tuned models, it¡¯s not
+doing badly. The running time of SVM is great, though not as great as a simple classify tree.
+This is expected since the model is relatively simple. To improve accuracy, there are some
+modifications we can make. Now that we have high dimensional data (49 pixels each image
+thus 49 features), the decision boundaries can hardly be linear, and the classes won¡¯t be
+perfectly linear separable. One choice we can make is to put regulations on the coefficients of
+the features. This will become a regularized SVM. Kernel SVM is another good option. Kernel
+transformation can make up more features of higher orders. With kernel transformations like
+RBF(radial basis function) which is very powerful and can overfitting almost everything, our
+models will perform better.
+
+### Model 5
+
+
+```{r code_model5_development, eval = TRUE}
+nb.model <- function(train.list){
+  res.list <- data.table()
+  for (i in 1:length(train.list)) {
+    num <- ifelse(i %% 3 == 0, 3, i %% 3)
+    sample.size = nrow(train.list[[i]])
+    model.name <- paste("naivebayes",sample.size,num,sep='_')
+    proportion <- round(sample.size/60000,4)
+    t.start <- Sys.time()
+    model.nb <- naiveBayes(train.list[[i]][,2:50], train.list[[i]]$label)
+    preds <- predict(model.nb, newdata = test.data[,2:50])
+    t.end <- Sys.time()
+    time <- round(min(1,(t.end - t.start)/60),4)
+    error <- round(1-sum(test.data$label==preds)/nrow(test.data),4)
+    Points <- round(0.25 * proportion + 0.25 * time + 0.5 * error,4)
+    tmp.datatable <- data.table("Model" = model.name,"Sample size" = sample.size,
+                                "A" = proportion, "B" = time, "C" = error, 
+                                "Points" = Points)
+    res.list <- rbind(res.list,tmp.datatable)
+    predictions[[i]] <<- cbind(predictions[[i]],as.data.frame(preds))
+    runtimes[[i]] <<- cbind(runtimes[[i]],as.data.frame(time))
+  }
+  return(res.list)
+}
+```
+
+```{r load_model5}
+nb.table <- nb.model(dat_whole_1)
+datatable(nb.table)
+nb.avg.table <- model.avg(nb.table, "naivebayes")
+datatable(nb.avg.table, rownames = FALSE)
+result1 <- rbind(result1,nb.table)
+result2 <- rbind(result2,nb.avg.table)
+```
+Naive Bayes: this is a classical Bayes classifier. We call it naive since it will naively assume
+independence of features while in real life there can always be some colinearity among different
+features. In a Bayesian classifier, we approximate a prior distribution of the result (which is the
+label here in our case). Then we use the data to approximate the distribution of the features.
+Using Bayes rule, we can approximate the probability of any new data, thus perform a
+prediction. For some simple data, this classifier can work well. However, for this dataset, our
+result is pretty bad. The error starts from 50% and is reduced to 43.7% with more data. With a
+small training set (500 input), the model is merely better than random guessing. In this fashion
+mnist dataset, one pixel and the pixel next to it certainly attain some dependence. This can be
+one reason why the model failed. Another reason may be, for image classification, the
+distribution is not easy to capture. Without an accurate distribution, the result won¡¯t be
+satisfying. My suggestion is to use more data, the naive Bayes model can be more accurate if
+that¡¯s the case. Even though the performance is bad, we may still use such a simple model as
+the baseline for model selection.
+
+
+### Model 6
+
+Neural Network
+```{r code_model6_development, eval = TRUE}
+nn.model <- function(train.list){
+  res.list <- data.table()
+  for (i in 1:length(train.list)) {
+    num <- ifelse(i %% 3 == 0, 3, i %% 3)
+    sample.size = nrow(train.list[[i]])
+    model.name <- paste("neuralnetworks",sample.size,num,sep='_')
+    proportion <- round(sample.size/60000,4)
+    t.start <- Sys.time()
+    model.nn <- nnet(label ~ ., data = train.list[[i]], size = 15, rang = 0.5,
+                     decay = 5e-3, trace =F)
+    preds <- predict(model.nn, newdata = test.data[,2:50], type = "class")
+    t.end <- Sys.time()
+    time <- round(min(1,(t.end - t.start)/60),4)
+    error <- round(1-sum(test.data$label==preds)/nrow(test.data),4)
+    Points <- round(0.25 * proportion + 0.25 * time + 0.5 * error,4)
+    tmp.datatable <- data.table("Model" = model.name,"Sample size" = sample.size,
+                                "A" = proportion, "B" = time, "C" = error, 
+                                "Points" = Points)
+    res.list <- rbind(res.list,tmp.datatable)
+    predictions[[i]] <<- cbind(predictions[[i]],as.data.frame(preds))
+    runtimes[[i]] <<- cbind(runtimes[[i]],as.data.frame(time))
+  }
+  return(res.list)
+}
+```
+
+```{r load_model6}
+nn.table <- nn.model(dat_whole_1)
+datatable(nn.table, rownames = FALSE)
+nn.avg.table <- model.avg(nn.table, "neuralnetworks")
+datatable(nn.avg.table, rownames = FALSE)
+result1 <- rbind(result1,nn.table)
+result2 <- rbind(result2,nn.avg.table)
+```
+Neural Network: the neural network is a framework in machine learning such that our model will
+learn things like neurons. With proper tuning of parameters, neural networks can learn anything.
+One great thing about the neural network is that we have many parameters (e.g. (the weights
+and biases between interconnected units ) to tune. This flexibility in parameters enable the
+model to learn extremely complicated dataset other simple models can never learn. Here the
+starting error is 50%, which is the same as the naive bayes classifier. However, the interesting
+thing is that the neural network learns things very quickly with increasing data. When we
+increase the input size to 2000, the error has been reduced to 37%. As I mentioned above, one
+thing that¡¯s important to neural networks is hyperparameters. A neural network has so many
+parameters, here I didn¡¯t do many model comparisons or grid search on model parameters.
+That¡¯s also the reason why our neural network is performing relatively bad.
+
+### Model 7
+
+multinomial linear regression
+```{r code_model7_development, eval = TRUE}
+
+library(nnet)
+
+mlr.model <- function(train.list){
+  res.list <- data.table()
+  for (i in 1:length(train.list)) {
+    num <- ifelse(i %% 3 == 0, 3, i %% 3)
+    sample.size = nrow(train.list[[i]])
+    model.name <- paste("multinom",sample.size,num,sep='_')
+    proportion <- round(sample.size/60000,4)
+    t.start <- Sys.time()
+    model.mlr <- multinom(label ~., data = train.list[[i]],trace = F)
+    preds <- predict(model.mlr, newdata = test.data, predict.all=TRUE)
+    t.end <- Sys.time()
+    time <- round(min(1,(t.end - t.start)/60),4)
+    error <- round(mean(preds != test.data$label),4)
+    Points <- round(0.25 * proportion + 0.25 * time + 0.5 * error,4)
+    tmp.datatable <- data.table("Model" = model.name,"Sample size" = sample.size,
+                                "A" = proportion, "B" = time, "C" = error, 
+                                "Points" = Points)
+    res.list <- rbind(res.list,tmp.datatable)
+    predictions[[i]] <<- cbind(predictions[[i]],as.data.frame(preds))
+    runtimes[[i]] <<- cbind(runtimes[[i]],as.data.frame(time))
+  }
+  return(res.list)
+}
+```
+
+```{r load_model7}
+mlr.table <- mlr.model(dat_whole_1)
+mlr.avg.table <- model.avg(mlr.table, "multinomial logistic regression")
+result1 <- rbind(result1,mlr.table)
+result2 <- rbind(result2,mlr.avg.table)
+datatable(mlr.table)
+datatable(mlr.avg.table, rownames = FALSE)
+```
+
+Multinomial logistic regression is a derivative of the generalized linear models. It models the distribution of the 10 groups as multinomial distribution and tries to fit the odd ratios to a linear regression model. We see from the results above, accuracy increases as dataset size increases. However, the improvement on accuracy does not offset the penalty on larger dataset and longer runtime as the points between the datasets are pretty much flat. Moreover, since all of our 9 sample datasets are balanced, additional variation is introduced to the model, which impact the prediction accuracy as well. For the purpose of our project, multinomial logistic regression may not be a good choice.
+
+### Model 8
+
+knn 3
+
+```{r code_model8_development, eval = TRUE}
+
+library(class)
+
+normalize <- function(x) {return ((x - min(x)) / (max(x) - min(x)))}
+
+knn.model <- function(train.list,knn.k){
+  res.list <- data.table()
+  for (i in 1:length(train.list)) {
+    num <- ifelse(i %% 3 == 0, 3, i %% 3)
+    sample.size = nrow(train.list[[i]])
+    model.name <- paste("knn",knn.k,sample.size,num,sep='_')
+    proportion <- round(sample.size/60000,4)
+    t.start <- Sys.time()
+    knn.train <- train.list[[i]][,2:50]
+    knn.train <- as.data.frame(lapply(knn.train, normalize))
+    knn.cl <- train.list[[i]]$label
+    knn.test <- test.data[,2:50]
+    knn.test <- as.data.frame(lapply(knn.test, normalize))
+    model.knn <- knn(train = knn.train, test = knn.test, cl = knn.cl, k = knn.k)
+    t.end <- Sys.time()
+    time <- round(min(1,(t.end - t.start)/60),4)
+    error <- round(mean(model.knn != test.data$label),4)
+    Points <- round(0.25 * proportion + 0.25 * time + 0.5 * error,4)
+    tmp.datatable <- data.table("Model" = model.name,"Sample size" = sample.size,
+                                "A" = proportion, "B" = time, "C" = error, 
+                                "Points" = Points)
+    res.list <- rbind(res.list,tmp.datatable)
+    predictions[[i]] <<- cbind(predictions[[i]],as.data.frame(model.knn, col.names=c("knn")))
+    runtimes[[i]] <<- cbind(runtimes[[i]],as.data.frame(time))
+  }
+  return(res.list)
+}
+
+```
+
+```{r load_model8}
+knn3.table <- knn.model(dat_whole_1,3)
+knn3.avg.table <- model.avg(knn3.table, "knn3")
+result1 <- rbind(result1,knn3.table)
+result2 <- rbind(result2,knn3.avg.table)
+datatable(knn3.table)
+datatable(knn3.avg.table, rownames = FALSE)
+```
+
+K-nearest neighbors is a machine learning method that is commonly used in pattern recognition. For each data point to predict, we look at the k points that are closest to the data point. Votes on the classification is conducted on the k neighbors, and the winning vote will be the prediction. In R, the default distance formula is Euclidean distance. The choice of parameter k is of discretion. A too small k will have little bias but increase the variance from the model. A too large k can reduce the noises in the model, but in the meanwhile also introduces bias to the model as well as largely increases the runtime as there will be more calculation on the distance. In this model we first try knn-3. From the chart above, we see that accuracies go up as sample sizes grows, and this improvement actually offsets the penalty on larger dataset and longer runtime. So samples with size 2000 has a decent performance under knn-3.
+
+### Model 9
+
+knn 7
+```{r code_model9_development, eval = TRUE}
+
+```
+
+```{r load_model9}
+knn7.table <- knn.model(dat_whole_1,7)
+datatable(knn7.table)
+knn7.avg.table <- model.avg(knn7.table, "knn7")
+datatable(knn7.avg.table, rownames = FALSE)
+result1 <- rbind(result1,knn7.table)
+result2 <- rbind(result2,knn7.avg.table)
+```
+
+We further investigate knn-7, which intuitively has a longer runtime comparing to the knn-3 model on the same datasets. Choosing an odd k again is because we try to avoid a tie in the vote. We donâ€™t see a significant improvement on either the accuracy or the points. So increase the number of neighbors from 3 to 7 may not be a good choice. In general, knn model has an average performance comparing to the other methods we tried. Further improvement on this model could be involved on tuning the parameter k for an empirical optimum. One way to achieve this is to use the bootstrap method. For the scope of this project, this step is omitted and left to further investigation.
+
+### Model 10
+
+aggregate model
+
+```{r code_model10_development, eval = TRUE}
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+agg.model <- function(train.list,rt){
+  res.list <- data.table()
+  for (i in 1:length(train.list)) {
+    num <- ifelse(i %% 3 == 0, 3, i %% 3)
+    sample.size = nrow(dat_whole_1[[i]])
+    model.name <- paste("aggregate",sample.size,num,sep='_')
+    proportion <- round(sample.size/60000,4)
+    preds <- apply(data.table(train.list[[i]]),1,getmode)
+    time <- apply(data.table(rt[[i]]),1,mean)
+    time <- round(min(1,time),4)
+    error <- round(1-sum(test.data$label==preds)/nrow(test.data),4)
+    Points <- round(0.25 * proportion + 0.25 * time + 0.5 * error,4)
+    tmp.datatable <- data.table("Model" = model.name,"Sample size" = sample.size,
+                                "A" = proportion, "B" = time, "C" = error, 
+                                "Points" = Points)
+    res.list <- rbind(res.list,tmp.datatable)
+    predictions[[i]] <<- cbind(predictions[[i]],as.data.frame(preds))
+  }
+  return(res.list)
+}
+```
+
+```{r load_model10}
+agg.table <- agg.model(predictions,runtimes)
+agg.avg.table <- model.avg(agg.table, "aggregate")
+result1 <- rbind(result1,agg.table)
+result2 <- rbind(result2,agg.avg.table)
+datatable(agg.table)
+datatable(agg.avg.table, rownames = FALSE)
+```
+
+The ensembling model provides predictions based on the results from previous 9 models. The mode of the predictions from the previous 9 models is chosen to be the prediction from this aggregate model. The runtime is defined to be the average run time for the 9 models above. We see the accuracy is around 80% with a decreasing pattern when increasing the sample sizes. The overall performance points are also competitive comparing to above results. 
+
+## Scoreboard
+
+```{r scoreboard}
+datatable(result1)
+datatable(result2)
+```
+
+## Discussion
+Our project includes 9 independent models, 1 ensembling model, data sample procedure, and data performance procedure. This report explains what we consider about the problem and how each part of function works. 
+
+# Discussion about score board
+In our score board, the formula is $0.25A+0.25B+0.5C$. In fact, if we change weights for each variable the score will be affected significantly. 
+
+The proportion of data, variable A, is determined by us completely. Since this part is positive related to final score, the weight we give on this term basic means how much we influence final score before the model trainning.
+
+B variable, the running time of model, is determines by many elements such as computer  performance, datasize and model property. This term can be reduced when we improve our hardware so that I don't recommend it as a huge weighted factor in the score formula. Overall, a smaller running time make sure we can work on the model flexible and efficient. 
+
+Usually, in machine learning competition, C variable which represents the inaccuracy rate is only score that matters. If we put more weight on accuracy, the score stands for the ability that our model predict on untraining data. This factor measures the most import goal of a machine learning model. A higher weight on inaccuracy rate will return a related small score for model if the model is work well enough.
+
+# What would you do if you had the computing resources to explore a wider variety of models and sample sizes?
+
+In this assignment, we implemented ten different models. It¡¯s more about the learning process.
+In real life, in industry, we care about accuracy and cost more. Therefore, if we have computing
+resources, we want to explore more complicated models as well as do the model selection to
+achieve better accuracy. One thing for model selection is cross-validation: we separate the
+training set into several folds. One at a time, set aside a fold of data which we call it validation
+set from the training set so that we can see how well the training result can be generalized to
+future data without seeing real future data. After averaging the results from validation sets, we
+can fairly tell how well a model performs. Another thing we can do is the grid search. We
+prespecify the range for our parameters to be searched in and run the model with all the
+possible parameters multiple times to get the best one. With the help of cross-validation and
+grid search, we can try complicated models like extreme boost since it has unprecedented
+performance on many data and train a more complicated neural network with many hidden
+layers using all the data we have.
+
+
+## References
+https://en.wikipedia.org/wiki/Decision_tree_learning
+
+https://en.wikipedia.org/wiki/Random_forest
+
+https://en.wikipedia.org/wiki/K-nearest_neighbors_algorithm#Parameter_selection
+
